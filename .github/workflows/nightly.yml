@@ -1,0 +1,130 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: "nightly"
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    name: Build macOS Nightly
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Build mistralrs-cli with Metal
+        run: cargo build --release --features metal -p mistralrs-cli
+
+      - name: Prepare installation structure
+        run: |
+          mkdir -p build/usr/local/bin
+          cp target/release/mistralrs build/usr/local/bin/
+          chmod +x build/usr/local/bin/mistralrs
+
+      - name: Create component package
+        run: |
+          pkgbuild \
+            --root build \
+            --identifier com.mistralrs.mistralrs \
+            --version 0.8.1-nightly \
+            --install-location / \
+            mistralrs-component.pkg
+
+      - name: Create distribution file
+        run: |
+          cat > distribution.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <installer-gui-script minSpecVersion="1">
+              <title>mistralrs</title>
+              <background file="background" alignment="bottomleft" scaling="none"/>
+              <welcome file="welcome"/>
+              <readme file="readme"/>
+              <license file="license"/>
+              <pkg-ref id="com.mistralrs.mistralrs"/>
+              <options customize="never" require-scripts="false"/>
+              <choices-outline>
+                  <line choice="default">
+                      <line choice="com.mistralrs.mistralrs"/>
+                  </line>
+              </choices-outline>
+              <choice id="default" title="mistralrs" description="Fast, flexible LLM inference.">
+                  <pkg-ref id="com.mistralrs.mistralrs"/>
+              </choice>
+              <choice id="com.mistralrs.mistralrs" visible="false" title="mistralrs" description="Fast, flexible LLM inference.">
+                  <pkg-ref id="com.mistralrs.mistralrs"/>
+              </choice>
+              <pkg-ref id="com.mistralrs.mistralrs" version="0.8.1-nightly" onConclusion="none">mistralrs-component.pkg</pkg-ref>
+          </installer-gui-script>
+          EOF
+
+      - name: Create product archive
+        run: |
+          productbuild \
+            --distribution distribution.xml \
+            --package-path . \
+            mistralrs-nightly.pkg
+
+      - name: Generate timestamp
+        id: timestamp
+        run: |
+          echo "timestamp=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          echo "date_tag=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Rename package with timestamp
+        run: |
+          mv mistralrs-nightly.pkg mistralrs-${{ steps.timestamp.outputs.timestamp }}-macos.pkg
+
+      - name: Create new nightly release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="nightly-${{ steps.timestamp.outputs.timestamp }}"
+          DATE="${{ steps.timestamp.outputs.date_tag }}"
+          
+          # Create release
+          gh release create "$TAG" \
+            --title "Nightly Build - $DATE" \
+            --notes "Automated nightly build for macOS. This release contains the latest development version of mistralrs." \
+            --prerelease \
+            mistralrs-${{ steps.timestamp.outputs.timestamp }}-macos.pkg
+
+      - name: Delete old nightly releases (keep only the latest one)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: "nightly-${{ steps.timestamp.outputs.timestamp }}"
+        run: |
+          # Get all nightly releases (tags matching pattern nightly-YYYYMMDD-HHMMSS)
+          releases=$(gh release list --json tagName --jq '.[].tagName' | grep -E '^nightly-[0-9]{8}-[0-9]{6}$' || true)
+          
+          if [ -n "$releases" ]; then
+            # Sort releases by timestamp (newest first)
+            sorted=$(echo "$releases" | sort -r)
+            
+            # Keep only the newest release (which is the one we just created)
+            # Delete all others
+            for release in $sorted; do
+              if [ "$release" != "$NEW_TAG" ]; then
+                echo "Deleting old release: $release"
+                # Delete release and associated tag
+                gh release delete "$release" --yes --cleanup-tag 2>/dev/null || true
+                
+                # Ensure tag is also deleted from the repository
+                git push origin --delete "$release" 2>/dev/null || true
+              fi
+            done
+          fi
